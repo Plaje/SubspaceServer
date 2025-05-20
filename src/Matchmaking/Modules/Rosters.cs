@@ -3,12 +3,12 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
-using Microsoft.Data.Sqlite;
 using SS.Core.ComponentInterfaces;
 using System.IO;
 using SS.Core;
 using System.Data.Common;
 using SS.Core.Modules;
+using Npgsql;
 
 namespace SS.Matchmaking.Modules
 {
@@ -16,46 +16,49 @@ namespace SS.Matchmaking.Modules
     {
         public void AddPlayer(String playerName, String squadName, Boolean isACaptain);
         public void RemovePlayer(String playerName);
-        public Dictionary<String, Boolean> GetRoster(String squadName);
-        public List<String> GetSquads();
+        public Task<Dictionary<String, Boolean>> GetRoster(String squadName);
+        public Task<List<String>> GetSquads();
     }
 
-    internal class Rosters : IModule, IRosters
+    internal class Rosters : IAsyncModule, IRosters
     {
         #region Properties
-        String ConnectionString { get; } = $"Data Source=./data/SS.Core.Modules.PersistSQLite.db;Foreign Keys=True;Pooling=True";
-        SqliteConnection Connection { get; }
+        String ConnectionString { get; set; }
+        private NpgsqlDataSource? DataSource { get; set; }
         private IChat Chat { get; }
         private ICommandManager CommandManager { get; }
         private InterfaceRegistrationToken<IRosters>? IRostersToken { get; set; }
+        private IConfigManager ConfigManager { get; }
         #endregion Properties
 
         #region Constructor
-        public Rosters(ICommandManager commandManager, IChat chat)
+        public Rosters(ICommandManager commandManager, IChat chat, IConfigManager configManager)
         {
             CommandManager = commandManager;
             Chat = chat;
+            ConfigManager = configManager;
 
             CommandManager.AddCommand("addplayer", Command_AddPlayer);
             CommandManager.AddCommand("removeplayer", Command_RemovePlayer);
             CommandManager.AddCommand("getroster", Command_GetRoster);
             CommandManager.AddCommand("getsquads", Command_GetSquads);
 
-            Connection = new(ConnectionString);
-            Connection.Open();
+            ConnectionString = ConfigManager.GetStr(ConfigManager.Global, "SS.Matchmaking", "DatabaseConnectionString");
+            DataSource = NpgsqlDataSource.Create(ConnectionString);
 
-            CreateRostersTableIfNotExists();
+            Task.Run(() => this.CreateRostersTableIfNotExists()).Wait();
+            ConfigManager = configManager;
         }
         #endregion Constructor
 
-        #region IModule
-        public bool Load(IComponentBroker broker)
+        #region IAsyncModule
+        public async Task<bool> LoadAsync(IComponentBroker broker, CancellationToken cancellationToken)
         {
             IRostersToken = broker.RegisterInterface<IRosters>(this);
             return true;
         }
 
-        public bool Unload(IComponentBroker broker)
+        public async Task<bool> UnloadAsync(IComponentBroker broker, CancellationToken cancellationToken)
         {
             InterfaceRegistrationToken<IRosters>? iRostersToken = IRostersToken;
             if (broker.UnregisterInterface(ref iRostersToken) != 0)
@@ -63,7 +66,7 @@ namespace SS.Matchmaking.Modules
 
             return true;
         }
-        #endregion IModule
+        #endregion IAsyncModule
 
         #region Commands
         public void Command_AddPlayer(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
@@ -114,7 +117,9 @@ namespace SS.Matchmaking.Modules
             try
             {
                 String squadName = parameters.ToString();
-                Dictionary<String, Boolean> roster = GetRoster(squadName);
+                var task = GetRoster(squadName);
+                task.Wait();
+                Dictionary<String, Boolean> roster = task.Result;
 
                 Chat.SendMessage(player, $"Roster for {squadName}:");
                 Chat.SendMessage(player, $"PlayerName            Captain");
@@ -138,7 +143,9 @@ namespace SS.Matchmaking.Modules
         {
             try
             {
-                List<String> squadList = GetSquads();
+                var task = GetSquads();
+                task.Wait();
+                List<String> squadList = task.Result;
 
                 Chat.SendMessage(player, $"Full list of squads:");
                 foreach (var squadName in squadList)
@@ -158,30 +165,33 @@ namespace SS.Matchmaking.Modules
         #endregion Commands
 
         #region Helper methods
-        public Boolean DoesTableExist()
+        public async Task<Boolean> DoesTableExist()
         {
-            var command = Connection.CreateCommand();
+            await using var dataSource = NpgsqlDataSource.Create(ConnectionString);
 
-            command.CommandText =
-                "SELECT EXISTS " +
+            await using (var cmd = dataSource.CreateCommand("SELECT EXISTS " +
                 "(SELECT FROM information_schema.tables " +
                 "WHERE table_schema = 'public' " +
-                "AND table_name = 'rosters')";
-
-            using (var reader = command.ExecuteReader())
+                "AND table_name = 'rosters')"))
+            await using (var reader = await cmd.ExecuteReaderAsync())
             {
-                return reader.GetBoolean(0);
+                while (await reader.ReadAsync())
+                {
+                    return reader.GetBoolean(0);
+                }
             }
+
+            return false;
         }
 
-        public void CreateRostersTableIfNotExists()
+        public async void CreateRostersTableIfNotExists()
         {
-            if (DoesTableExist())
+            if (await DoesTableExist())
                 return;
 
-            SqliteCommand command = Connection.CreateCommand();
-
-            command.CommandText = @"-- Table: public.rosters
+            // Insert some data
+            await using (var command = DataSource.CreateCommand(
+                @"-- Table: public.rosters
 
 -- DROP TABLE IF EXISTS public.rosters;
 
@@ -197,95 +207,103 @@ CREATE TABLE IF NOT EXISTS public.rosters
 TABLESPACE pg_default;
 
 ALTER TABLE IF EXISTS public.rosters
-    OWNER to postgres;";
-
-            command.ExecuteNonQuery();
+    OWNER to postgres;"
+                ))
+            {
+                await command.ExecuteNonQueryAsync();
+            }
         }
 
-        public void AddPlayer(string playerName, string squadName, bool isACaptain)
+        public async void AddPlayer(string playerName, string squadName, bool isACaptain)
         {
-            if (PlayerExists(playerName))
+            if (await PlayerExists(playerName))
                 return;
 
-            SqliteCommand command = Connection.CreateCommand();
-
-            command.CommandText =
+            await using (var command = DataSource.CreateCommand(
                 "insert into public.rosters " +
                 "(\"PlayerName\", \"SquadName\", \"Captain\") " +
-                "values ($playerName, $squadName, $isACaptain);";
-            command.Parameters.AddWithValue("$playerName", playerName);
-            command.Parameters.AddWithValue("$squadName", squadName);
-            command.Parameters.AddWithValue("$isACaptain", isACaptain);
+                "values ($1, $2, $3);"
+                ))
+            {
+                command.Parameters.AddWithValue(playerName);
+                command.Parameters.AddWithValue(squadName);
+                command.Parameters.AddWithValue(isACaptain);
 
-            command.ExecuteNonQuery();
+                await command.ExecuteNonQueryAsync();
+            }
         }
 
-        public void RemovePlayer(string playerName)
+        public async void RemovePlayer(string playerName)
         {
-            SqliteCommand command = Connection.CreateCommand();
+            await using (var command = DataSource.CreateCommand(
+                "delete from public.\"rosters\" r where r.\"PlayerName\" = $1;"
+                ))
+            {
+                command.Parameters.AddWithValue(playerName);
 
-            command.CommandText =
-                "delete from public.\"rosters\" r where r.\"PlayerName\" = $playerName;";
-            command.Parameters.AddWithValue("$playerName", playerName);
-
-            command.ExecuteNonQuery();
+                await command.ExecuteNonQueryAsync();
+            }
         }
 
-        public Dictionary<String, Boolean> GetRoster(string squadName)
+        public async Task<Dictionary<String, Boolean>> GetRoster(string squadName)
         {
             Dictionary<String, Boolean> rosterData = new();
 
-            var command = Connection.CreateCommand();
-
-            command.CommandText =
+            // Retrieve all rows
+            await using var command = DataSource.CreateCommand(
                 "select * from public.\"rosters\" r " +
-                "where r.\"SquadName\" = $squadName;";
-            command.Parameters.AddWithValue("$squadName", squadName);
+                "where r.\"SquadName\" = $1;"
+                );
+            command.Parameters.AddWithValue(squadName);
 
-            using (var reader = command.ExecuteReader())
+            await using (var reader = await command.ExecuteReaderAsync())
             {
-                while (reader.Read())
+                while (await reader.ReadAsync())
                 {
                     rosterData.Add(reader.GetString(1), reader.GetBoolean(3));
                 }
-
-                return rosterData;
             }
+
+            return rosterData;
         }
 
-        public List<string> GetSquads()
+        public async Task<List<String>> GetSquads()
         {
             List<String> squads = new();
 
-            var command = Connection.CreateCommand();
+            // Retrieve all rows
+            await using var command = DataSource.CreateCommand(
+                "select distinct \"SquadName\" from public.rosters"
+                );
 
-            command.CommandText =
-                "select distinct \"SquadName\" from public.rosters";
-
-            using (var reader = command.ExecuteReader())
+            await using (var reader = await command.ExecuteReaderAsync())
             {
-                while (reader.Read())
+                while (await reader.ReadAsync())
                 {
                     squads.Add(reader.GetString(0));
                 }
-
-                return squads;
             }
+
+            return squads;
         }
 
-        private Boolean PlayerExists(String playerName)
+        private async Task<Boolean> PlayerExists(String playerName)
         {
-            var command = Connection.CreateCommand();
-
-            command.CommandText =
+            await using var command = DataSource.CreateCommand(
                 "select * from public.\"rosters\" r " +
-                "where r.\"PlayerName\" = $playerName;";
-            command.Parameters.AddWithValue("$playerName", playerName);
+                "where r.\"PlayerName\" = $1;"
+                );
+            command.Parameters.AddWithValue(playerName);
 
-            using (var reader = command.ExecuteReader())
+            await using (var reader = await command.ExecuteReaderAsync())
             {
-                return reader.Read();
+                while (await reader.ReadAsync())
+                {
+                    return reader.Read();
+                }
             }
+
+            return false;
         }
         #endregion Helper methods
     }
