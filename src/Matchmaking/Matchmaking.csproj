@@ -9,8 +9,8 @@
     <VersionPrefix>4.0.0</VersionPrefix>
     <EnableDynamicLoading>true</EnableDynamicLoading>
     <OutDir>$(SolutionDir)SubspaceServer\Zone\bin\modules\$(MSBuildProjectName)</OutDir>
-    <FileVersion>4.0.0.1</FileVersion>
-    <AssemblyVersion>4.0.0.1</AssemblyVersion>
+    <FileVersion>4.0.0.2</FileVersion>
+    <AssemblyVersion>4.0.0.2</AssemblyVersion>
   </PropertyGroup>
 
   <ItemGroup>

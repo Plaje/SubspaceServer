@@ -9,6 +9,7 @@ using SS.Core;
 using System.Data.Common;
 using SS.Core.Modules;
 using Npgsql;
+using System.Numerics;
 
 namespace SS.Matchmaking.Modules
 {
@@ -20,7 +21,7 @@ namespace SS.Matchmaking.Modules
         public Task<List<String>> GetSquads();
     }
 
-    internal class Rosters : IAsyncModule, IRosters
+    internal class Rosters : IAsyncModule, IRosters, IDisposable
     {
         #region Properties
         String ConnectionString { get; set; }
@@ -114,57 +115,63 @@ namespace SS.Matchmaking.Modules
 
         public void Command_GetRoster(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
         {
-            try
-            {
-                String squadName = parameters.ToString();
-                var task = GetRoster(squadName);
-                task.Wait();
-                Dictionary<String, Boolean> roster = task.Result;
-
-                Chat.SendMessage(player, $"Roster for {squadName}:");
-                Chat.SendMessage(player, $"PlayerName            Captain");
-
-                foreach (var playerEntry in roster)
-                {
-                    Chat.SendMessage(player, $"{playerEntry.Key:20} {playerEntry.Value:5}");
-                }
-            }
-            catch (Exception e)
-            {
-                try
-                {
-                    Chat.SendMessage(player, e.Message);
-                }
-                catch { }
-            }
+            String squadName = parameters.ToString();
+            GetRosterIntermediary(player,squadName);
         }
 
         public void Command_GetSquads(ReadOnlySpan<char> commandName, ReadOnlySpan<char> parameters, Player player, ITarget target)
         {
+            GetSquadsIntermediary(player);
+        }
+        #endregion Commands
+
+        #region Helper methods
+        public async void GetSquadsIntermediary(Player playerToReply)
+        {
             try
             {
-                var task = GetSquads();
-                task.Wait();
-                List<String> squadList = task.Result;
+                List<String> squadList = await GetSquads();
 
-                Chat.SendMessage(player, $"Full list of squads:");
+                Chat.SendMessage(playerToReply, $"Full list of squads:");
                 foreach (var squadName in squadList)
                 {
-                    Chat.SendMessage(player, squadName);
+                    Chat.SendMessage(playerToReply, squadName);
                 }
             }
             catch (Exception e)
             {
                 try
                 {
-                    Chat.SendMessage(player, e.Message);
+                    Chat.SendMessage(playerToReply, e.Message);
                 }
                 catch { }
             }
         }
-        #endregion Commands
 
-        #region Helper methods
+        public async void GetRosterIntermediary(Player playerToReply, String squadName)
+        {
+            try
+            {
+                Dictionary<String, Boolean> roster = await GetRoster(squadName);
+
+                Chat.SendMessage(playerToReply, $"Roster for {squadName}:");
+                Chat.SendMessage(playerToReply, $"PlayerName            Captain");
+
+                foreach (var playerEntry in roster)
+                {
+                    Chat.SendMessage(playerToReply, $"{playerEntry.Key:20} {playerEntry.Value:5}");
+                }
+            }
+            catch (Exception e)
+            {
+                try
+                {
+                    Chat.SendMessage(playerToReply, e.Message);
+                }
+                catch { }
+            }
+        }
+
         public async Task<Boolean> DoesTableExist()
         {
             await using var dataSource = NpgsqlDataSource.Create(ConnectionString);
@@ -304,6 +311,12 @@ ALTER TABLE IF EXISTS public.rosters
             }
 
             return false;
+        }
+
+        public void Dispose()
+        {
+            if (DataSource != null)
+                DataSource.Dispose();
         }
         #endregion Helper methods
     }
